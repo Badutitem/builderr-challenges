@@ -1,4 +1,6 @@
-"""Meridian — broad, volatility-targeted momentum rotation (builderr Trading v0, Round 2).
+"""Dual — classic dual momentum: 126d+63d blend, equal weight,
+relative-strength gate (a name must beat SPY's 63d return to qualify).
+(Base: Meridian v1, tournament variant — not the submitted file.)
 
 Strategy in one paragraph
 -------------------------
@@ -43,13 +45,13 @@ from typing import Any, Optional
 # ---------------------------------------------------------------------------
 MIN_BARS = 127            # history needed for the 126d momentum leg
 IDX_MIN_BARS = 60         # history needed for index regime features
-TOP_N = 7                 # leaders held at once
-NAME_CAP = 0.24           # per-ticker target cap (rule limit is 0.30)
+TOP_N = 8
+NAME_CAP = 0.20
 DRIFT_LIMIT = 0.26        # force a rebalance if a position drifts above this
 MAX_BETA_GROSS = 1.40     # self-clamp, below the 1.5x rule cap
 MIN_TRADE_PCT = 0.03      # dead-band: ignore target deltas below 3% of equity
-KEEP_RANK = 10            # incumbents ranked this high are kept (anti-churn)
-FORCE_RANK = 4            # the top-4 ranked names are always selected
+KEEP_RANK = 12
+FORCE_RANK = 5
 CASH_BUFFER = 0.98        # spend at most 98% of expected sell proceeds
 MAX_ORDERS = 45           # rule cap is 50 trades/day
 REBALANCE_DAYS = 3        # scheduled rebalance cadence (trading days)
@@ -58,11 +60,11 @@ PRICE_FLOOR = 2.0         # skip sub-$2 names (junk/odd lots in the live list)
 # Momentum blend (weights sum informally; score is only used for ranking).
 # The 63d/21d legs lead — they identify the CURRENT leaders; the 126d leg
 # is only a stabilizer.
-W_MOM_LONG = 0.15         # 126-day return
-W_MOM_MID = 0.45          # 63-day return
-W_MOM_SHORT = 0.30        # 21-day return
-W_GAP = 0.10              # distance above SMA50
-W_VOL_PEN = 0.10          # penalty per unit of 20d annualized vol
+W_MOM_LONG = 0.50
+W_MOM_MID = 0.50
+W_MOM_SHORT = 0.0
+W_GAP = 0.0
+W_VOL_PEN = 0.0
 
 # Regime / exposure.
 BUDGET_FULL = 1.00
@@ -269,6 +271,8 @@ def _rank_universe(market_state: dict, cache: dict) -> tuple[list, float]:
     ranked: list[tuple[float, str, float]] = []
     n_up = 0
     n_all = 0
+    spy_closes = _closes_of(market_state, "SPY", cache)
+    spy_r63 = _ret(spy_closes, 63) if spy_closes else None
     for ticker in sorted(market_state):
         t = ticker.upper()
         if _beta(t) != 1.0:
@@ -287,6 +291,9 @@ def _rank_universe(market_state: dict, cache: dict) -> tuple[list, float]:
         if score is None or sma20 is None:
             continue
         r_short = _ret(closes, 21)
+        r_mid = _ret(closes, 63)
+        if spy_r63 is not None and (r_mid is None or r_mid <= spy_r63):
+            continue  # dual momentum: must beat the index
         # Trend gates: still in an uptrend, short leg not a falling knife.
         if closes[-1] <= sma50 or closes[-1] <= sma20:
             continue
@@ -348,7 +355,7 @@ def _build_targets(state: str, budget: float, sleeve_dollar: float,
         n = len(selected)
         raw = {}
         for i, (_, t, v) in enumerate(selected):
-            raw[t] = math.sqrt(float(n - i) * (1.0 / max(v, 0.08)))
+            raw[t] = 1.0  # dual variant: equal weight
         remaining = core_budget
         pool = [t for (_, t, _) in selected]
         for _ in range(3):
