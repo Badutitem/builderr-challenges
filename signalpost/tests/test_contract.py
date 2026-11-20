@@ -117,3 +117,78 @@ def test_caching_fetcher_roundtrip(tmp_path) -> None:
     persisted = list(tmp_path.glob("*.json"))
     assert len(persisted) == 1
     assert json.loads(persisted[0].read_text(encoding="utf-8"))["status"] == 200
+
+
+def _site_profile(publishable: bool, pages: list[dict]) -> dict:
+    profile = sample_profile()
+    profile["evidence"]["website"] = evidence(
+        "website", "available", "registry_linked_company_website", "https://example.no",
+        value={
+            "final_url": "https://example.no/",
+            "description": "Example company site.",
+            "social_links": [],
+            "pages": pages,
+            "crawl_errors": [],
+            "identity_assessment": {
+                "publishable": publishable,
+                "status": "exact" if publishable else "review",
+                "score": 0.95 if publishable else 0.85,
+            },
+        },
+        content_sha256="9" * 64,
+    )
+    return profile
+
+
+def _by_field(envelope: dict) -> dict:
+    grouped: dict[str, list[dict]] = {}
+    for claim in envelope["claims"]:
+        grouped.setdefault(claim["field"], []).append(claim)
+    return grouped
+
+
+def test_v2_site_pages_feed_hiring_and_activity_claims() -> None:
+    pages = [
+        {"url": "https://example.no/", "title": "Home"},
+        {"url": "https://example.no/karriere/ledige-stillinger", "title": "Ledige stillinger"},
+        {"url": "https://example.no/aktuelt/ny-avdeling", "title": "Ny avdeling åpnet"},
+        {"url": "https://example.no/aktuelt/ny-avdeling", "title": "Duplicate URL must be deduped"},
+    ]
+    envelope = build_envelope(_site_profile(True, pages), run_id="v2a", started_at="2026-11-20T00:00:00Z",
+                              completed_at="2026-11-20T00:00:05Z", runtime_ms=100, requests=3)
+    by_field = _by_field(envelope)
+    jobs = by_field["job_postings"]
+    assert len(jobs) == 1 and jobs[0]["availability"] == "available"
+    assert jobs[0]["value"]["url"].endswith("/karriere/ledige-stillinger")
+    activity = by_field["dated_public_activity"]
+    assert len(activity) == 1 and activity[0]["availability"] == "available"
+    assert envelope["sections"]["hiring_and_activity"] == "available"
+    assert "careers/jobs page" in envelope["summary"]
+    # Available site claims must point at evidence that exists.
+    evidence_ids = {item["id"] for item in envelope["evidence"]}
+    for claim in jobs + activity:
+        assert claim["evidence_ids"] and set(claim["evidence_ids"]) <= evidence_ids
+
+
+def test_v2_quarantined_site_never_feeds_hiring_or_activity() -> None:
+    pages = [
+        {"url": "https://example.no/karriere", "title": "Karriere"},
+        {"url": "https://example.no/nyheter", "title": "Nyheter"},
+    ]
+    envelope = build_envelope(_site_profile(False, pages), run_id="v2b", started_at="2026-11-20T00:00:00Z",
+                              completed_at="2026-11-20T00:00:05Z", runtime_ms=100, requests=3)
+    by_field = _by_field(envelope)
+    assert by_field["job_postings"][0]["availability"] == "not_available"
+    assert by_field["dated_public_activity"][0]["availability"] == "not_available"
+    assert envelope["sections"]["hiring_and_activity"] == "not_available"
+    assert by_field["official_website"][0]["availability"] == "ambiguous"
+
+
+def test_v2_publishable_site_without_matching_pages_stays_not_available() -> None:
+    pages = [{"url": "https://example.no/om-oss", "title": "Om oss"}]
+    envelope = build_envelope(_site_profile(True, pages), run_id="v2c", started_at="2026-11-20T00:00:00Z",
+                              completed_at="2026-11-20T00:00:05Z", runtime_ms=100, requests=3)
+    by_field = _by_field(envelope)
+    assert by_field["job_postings"][0]["availability"] == "not_available"
+    assert by_field["dated_public_activity"][0]["availability"] == "not_available"
+    assert "not found" in by_field["job_postings"][0]["note"]

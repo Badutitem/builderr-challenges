@@ -16,8 +16,12 @@ Rules honoured here:
 - Website-derived claims are only published when the deterministic identity
   gate marks the site an exact match; otherwise they are ``ambiguous``
   (quarantined), mirroring ``identity.apply_website_identity_gate``.
-- Hiring / dated-activity families have no permitted live connector in this
-  build, so they are declared ``not_available`` with an explanatory note
+- Hiring / dated-activity families (v2): no permitted *external* connector
+  is configured, so those families are sourced only from pages crawled on
+  the identity-verified company website itself (careers/jobs pages and
+  news/activity pages, both ``permitted_public_page`` evidence). When the
+  bounded crawl found no such page — or the site did not pass the identity
+  gate — the family stays ``not_available`` with an explanatory note
   instead of being silently omitted or fabricated.
 - The synthesis paragraph only restates claim values; unknowns are listed
   explicitly in ``unknowns``.
@@ -26,7 +30,9 @@ Rules honoured here:
 from __future__ import annotations
 
 import json
+import re
 from typing import Any, Iterable
+from urllib.parse import urlparse
 
 from .refresh import diff_profile
 
@@ -40,6 +46,34 @@ STATE_MAP = {
 }
 
 MAX_LIST_CLAIMS = 25
+MAX_SITE_PAGE_CLAIMS = 10
+
+# Page-path classifiers for the v2 site-sourced hiring/activity families.
+# News mirrors scripts/extract_company_site_news.py; careers covers the
+# Norwegian and English labels companies actually use for jobs pages.
+_NEWS_SEGMENTS = {"news", "newsroom", "press", "presse", "pressemelding", "pressemeldinger", "aktuelt", "nyheter", "artikler", "blog"}
+_CAREER_SEGMENT_PREFIXES = (
+    "karriere", "karrier", "ledige", "ledig", "stillinger", "stilling",
+    "jobb", "jobbe", "career", "careers", "job", "jobs", "vacancies",
+    "vacancy", "work-with-us", "bli-medarbeider",
+)
+
+
+def _page_segments(url: Any) -> list[str]:
+    path = urlparse(str(url or "")).path.casefold()
+    return [segment for segment in re.split(r"[^a-z0-9æøå]+", path) if segment]
+
+
+def _is_news_page(url: Any) -> bool:
+    return any(segment in _NEWS_SEGMENTS for segment in _page_segments(url))
+
+
+def _is_career_page(url: Any) -> bool:
+    return any(
+        segment.startswith(prefix)
+        for segment in _page_segments(url)
+        for prefix in _CAREER_SEGMENT_PREFIXES
+    )
 
 
 def map_state(status: str | None) -> str:
@@ -331,10 +365,47 @@ def build_envelope(
         b.errors.append({"module": "website_page", "source_url": crawl_error.get("url"), "error": crawl_error.get("error")})
 
     # 5 — Hiring and dated public activity --------------------------------
-    b.claim("job_postings", None, "not_available", None, confidence=0.9,
-            note="No permitted jobs connector is configured in this run; checked state is 'not checked', not zero postings.")
-    b.claim("dated_public_activity", None, "not_available", None, confidence=0.9,
-            note="No permitted news/activity connector is configured in this run.")
+    # v2: sourced only from bounded pages crawled on the identity-verified
+    # company website (permitted_public_page evidence, website module).
+    # A careers-page claim records that the verified site publishes a jobs
+    # page; it never invents individual postings or counts. Pages from a
+    # quarantined (non-publishable) site are never used here.
+    site_pages = (web_value.get("pages") or []) if (web_state == "available" and publishable) else []
+    job_pages: list[dict[str, Any]] = []
+    news_pages: list[dict[str, Any]] = []
+    seen_page_urls: set[str] = set()
+    for page in site_pages:
+        page_url = str(page.get("url") or "")
+        if not page_url.startswith(("http://", "https://")) or page_url in seen_page_urls:
+            continue
+        if _is_career_page(page_url):
+            seen_page_urls.add(page_url)
+            job_pages.append(page)
+        elif _is_news_page(page_url):
+            seen_page_urls.add(page_url)
+            news_pages.append(page)
+    if job_pages:
+        for page in job_pages[:MAX_SITE_PAGE_CLAIMS]:
+            b.claim("job_postings", {"url": page.get("url"), "title": (page.get("title") or "")[:500],
+                                     "source": "company_careers_page"},
+                    "available", "website", confidence=0.8,
+                    note="Careers/jobs page found on the identity-verified company website; "
+                         "the postings themselves are listed on that page and are not counted here.")
+    else:
+        b.claim("job_postings", None, "not_available", None, confidence=0.9,
+                note="No careers/jobs page was found in the bounded crawl of the verified company site, "
+                     "and no permitted external jobs connector is configured; this is 'not found', not zero postings.")
+    if news_pages:
+        for page in news_pages[:MAX_SITE_PAGE_CLAIMS]:
+            b.claim("dated_public_activity", {"url": page.get("url"), "title": (page.get("title") or "")[:500],
+                                              "source": "company_site_news_page"},
+                    "available", "website", confidence=0.8,
+                    note="News/activity page on the identity-verified company website; "
+                         "company-reported activity, not independent coverage.")
+    else:
+        b.claim("dated_public_activity", None, "not_available", None, confidence=0.9,
+                note="No news/activity page was found in the bounded crawl of the verified company site, "
+                     "and no permitted external news connector is configured.")
 
     # 7 — Refresh metadata and changes --------------------------------------
     changes: list[dict[str, Any]] = []
@@ -355,7 +426,7 @@ def build_envelope(
         "annual_accounts": "available" if records else fin_state,
         "leadership_and_workplaces": "available" if (active_roles or loc_items) else roles_state,
         "website_and_profiles": "available" if (web_state == "available" and publishable) else web_state,
-        "hiring_and_activity": "not_available",
+        "hiring_and_activity": "available" if (job_pages or news_pages) else "not_available",
         "evidence_and_availability": "available",
         "refresh": "available",
     }
@@ -432,6 +503,12 @@ def _synthesise(
         text += f" {len(locations)} registered subunit(s) are on record."
     site = first("official_website")
     text += f" Verified official website: {site}." if site else " No identity-verified official website was established."
+    job_claims = [claim for claim in claims if claim["field"] == "job_postings" and claim["availability"] == "available"]
+    if job_claims:
+        text += f" Its verified website publishes a careers/jobs page ({job_claims[0]['value'].get('url')})."
+    activity_claims = [claim for claim in claims if claim["field"] == "dated_public_activity" and claim["availability"] == "available"]
+    if activity_claims:
+        text += f" {len(activity_claims)} news/activity page(s) were found on its verified website."
     if had_previous:
         text += f" Refresh detected {len(changes)} material change(s) versus the previous snapshot."
     return text

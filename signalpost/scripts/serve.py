@@ -24,6 +24,7 @@ Run:
 from __future__ import annotations
 
 import argparse
+import html as html_lib
 import json
 import re
 import sys
@@ -60,6 +61,28 @@ class Store:
             return None
         return json.loads(path.read_text(encoding="utf-8"))
 
+    def list_companies(self) -> list[dict[str, Any]]:
+        base = self.root / "snapshots"
+        rows: list[dict[str, Any]] = []
+        if not base.exists():
+            return rows
+        for child in sorted(base.iterdir()):
+            latest = child / "latest.json"
+            if not (child.is_dir() and latest.exists()):
+                continue
+            try:
+                stored = json.loads(latest.read_text(encoding="utf-8"))
+            except (ValueError, OSError):
+                continue
+            profile = stored.get("profile") or {}
+            envelope = stored.get("envelope") or {}
+            rows.append({
+                "organisation_number": child.name,
+                "name": profile.get("name") or "",
+                "terminal_status": (envelope.get("run") or {}).get("terminal_status") or "",
+            })
+        return rows
+
     def save(self, org: str, payload: dict[str, Any]) -> Path:
         directory = self._dir(org)
         stamp = utc_now().replace(":", "").replace("-", "")
@@ -95,6 +118,72 @@ class Agent:
         return profile, envelope
 
 
+_PAGE_CSS = (
+    "body{font-family:system-ui,sans-serif;max-width:960px;margin:2rem auto;padding:0 1rem;color:#1a1a1a}"
+    "table{border-collapse:collapse;width:100%}td,th{border:1px solid #ddd;padding:.35rem .5rem;text-align:left;vertical-align:top}"
+    ".na{color:#8a6d00}.ok{color:#0a6b2d}code{background:#f2f2f2;padding:.1rem .3rem}input,button{font-size:1rem;padding:.4rem}"
+)
+
+
+def _esc(value: Any) -> str:
+    return html_lib.escape(json.dumps(value, ensure_ascii=False, default=str) if not isinstance(value, str) else value)
+
+
+def render_index(companies: list[dict[str, Any]]) -> str:
+    rows = "".join(
+        f'<tr><td><a href="/view/{html_lib.escape(c["organisation_number"])}">{html_lib.escape(c["organisation_number"])}</a></td>'
+        f'<td>{html_lib.escape(c["name"])}</td><td>{html_lib.escape(c["terminal_status"])}</td></tr>'
+        for c in companies
+    ) or '<tr><td colspan="3">No stored companies yet — look one up above.</td></tr>'
+    return (
+        "<!doctype html><html><head><meta charset='utf-8'><title>Signalpost — Norway company research</title>"
+        f"<style>{_PAGE_CSS}</style></head><body>"
+        "<h1>Signalpost — Norway company research</h1>"
+        "<p>Every value below is backed by claim-level evidence; missing data is labelled, never shown as zero.</p>"
+        "<form onsubmit=\"location='/view/'+document.getElementById('org').value;return false\">"
+        "<input id='org' pattern='[0-9]{9}' placeholder='Organisation number (9 digits)' required> "
+        "<button type='submit'>Find company</button></form>"
+        "<h2>Researched companies</h2><table><tr><th>Org number</th><th>Name</th><th>Status</th></tr>"
+        f"{rows}</table>"
+        "<p>JSON API: <code>/companies/:org</code> · <code>/research?org=…&amp;q=…</code> · <code>/refresh?org=…</code></p>"
+        "</body></html>"
+    )
+
+
+def render_company(envelope: dict[str, Any]) -> str:
+    org = html_lib.escape(str(envelope.get("organisation_number") or ""))
+    evidence_by_id = {item.get("id"): item for item in envelope.get("evidence") or []}
+    claim_rows = []
+    for claim in envelope.get("claims") or []:
+        availability = str(claim.get("availability") or "")
+        css = "ok" if availability == "available" else "na"
+        links = []
+        for ev_id in claim.get("evidence_ids") or []:
+            item = evidence_by_id.get(ev_id) or {}
+            url = item.get("source_url")
+            if url:
+                links.append(f'<a href="{html_lib.escape(str(url))}">verify source</a>')
+        claim_rows.append(
+            f"<tr><td>{html_lib.escape(str(claim.get('field')))}</td>"
+            f"<td>{_esc(claim.get('value'))}</td>"
+            f"<td class='{css}'>{html_lib.escape(availability)}</td>"
+            f"<td>{' · '.join(links)}</td></tr>"
+        )
+    unknowns = ", ".join(html_lib.escape(str(u)) for u in envelope.get("unknowns") or []) or "none"
+    return (
+        "<!doctype html><html><head><meta charset='utf-8'>"
+        f"<title>{org} — Signalpost</title><style>{_PAGE_CSS}</style></head><body>"
+        f"<p><a href='/'>← All companies</a></p><h1>{org}</h1>"
+        f"<p>{html_lib.escape(str(envelope.get('summary') or ''))}</p>"
+        "<table><tr><th>Field</th><th>Value</th><th>Availability</th><th>Evidence</th></tr>"
+        f"{''.join(claim_rows)}</table>"
+        f"<p><strong>Unknowns (labelled, not zero):</strong> {unknowns}</p>"
+        f"<p>Compare/refresh: <a href='/refresh?org={org}'>refresh against sources</a> · "
+        f"<a href='/companies/{org}'>raw JSON envelope</a></p>"
+        "</body></html>"
+    )
+
+
 def make_handler(agent: Agent):
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
@@ -106,6 +195,14 @@ def make_handler(agent: Agent):
             raw = json.dumps(payload, ensure_ascii=False).encode("utf-8")
             self.send_response(status)
             self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(raw)))
+            self.end_headers()
+            self.wfile.write(raw)
+
+        def _send_html(self, status: int, page: str) -> None:
+            raw = page.encode("utf-8")
+            self.send_response(status)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_header("Content-Length", str(len(raw)))
             self.end_headers()
             self.wfile.write(raw)
@@ -153,8 +250,17 @@ def make_handler(agent: Agent):
                 if org:
                     self._refresh(org)
                 return
-            if parts == [] or parts == ["health"]:
-                self._send(200, {"status": "ok", "routes": ["/companies/:organisation_number", "/research", "/refresh"]})
+            if len(parts) == 2 and parts[0] == "view":
+                org = self._org_or_400(parts[1])
+                if org:
+                    _profile, envelope = agent.research_company(org, live=False)
+                    self._send_html(200, render_company(envelope))
+                return
+            if parts == ["health"]:
+                self._send(200, {"status": "ok", "routes": ["/", "/view/:organisation_number", "/companies/:organisation_number", "/research", "/refresh"]})
+                return
+            if parts == []:
+                self._send_html(200, render_index(agent.store.list_companies()))
                 return
             self._send(404, {"error": "unknown route"})
 
